@@ -178,3 +178,4 @@ cython_debug/
 .pypirc
 
 test.py
+*.csv

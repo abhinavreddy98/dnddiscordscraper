@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 load_dotenv()
 # --- settings --------------------------------------------------------------
 TOKEN      = os.getenv("DISCORD_TOKEN")
-CHANNEL_ID = int("1378712719124992000")#1378673668279762954int(os.getenv("CHANNEL_ID"))
+CHANNEL_ID = int("1279048805194530817")#1378673668279762954int(os.getenv("CHANNEL_ID"))
 print(CHANNEL_ID)
 
 # Works both for /characters/<id> and /profile/<name>/characters/<id>
@@ -22,16 +22,19 @@ URL_RE = re.compile(
 )
 
 CSV_PATH = "characters.csv"
+FAILED_CSV_PATH = "failedtoscrapecharacters.csv"
 HEADLESS = True          # set to False while debugging scraping
 CONCURRENCY = 5          # how many pages to fetch in parallel
+scrapefail = []
 # ---------------------------------------------------------------------------
 
 
-async def scrape_character(url: str, playwright):
-    """Return dict {url, level, class, subclass} or None on failure."""
+async def scrape_character(pair, playwright):
+    """Return dict or None on failure."""
     browser = await playwright.chromium.launch(headless=HEADLESS)
     page    = await browser.new_page()
     try:
+        thread_name, url = pair
         print(url)
         await page.goto(url, timeout=90_000)
         # Wait for the header that always loads, even without logging in
@@ -43,25 +46,28 @@ async def scrape_character(url: str, playwright):
         level = int(re.search(r'\d+', raw_text).group())
         print(level)
         locator    = page.locator('[class="ddbc-character-summary__classes"]').first
-        class_text = await locator.inner_text()          # e.g. 'LVL 8'
-        print(class_text)
+        class_text = await locator.inner_text()          # e.g. 'Fighter'
+        #print(class_text)
+        locator    = page.locator('[class="ddbc-character-summary__race"]').first
+        species = await locator.inner_text()          # e.g. 'Human'
+        #print(species)
         armorclass = await page.locator('[data-testid="armor-class-value"]').inner_text()
-        print(armorclass)
+        #print(armorclass)
         maxhp = await page.locator('[data-testid="max-hp"]').inner_text()
-        print(maxhp)
+        #print(maxhp)
         #subclass_text = await page.locator('[data-testid="class-summary-subclass"]').inner_text()
-        abilities = page.locator('.ddbc-ability-summary')      # list-like Locator
         #Ability Scores
+        abilities = page.locator('.ddbc-ability-summary')      # list-like Locator
         ability_scores = {}
         for i in range(await abilities.count()):
             block   = abilities.nth(i)
             name    = (await block.locator('.ddbc-ability-summary__label')
                                 .inner_text()).strip()          # "Strength"
             score   = int((await block.locator('.ddbc-ability-summary__secondary')
-                                    .inner_text()).strip())    # 20
+                                    .inner_text()).replace('\n', '').strip())    # 20
             ability_scores[name] = score
 
-        print(ability_scores)
+        #print(ability_scores)
         #Saving Throws
         saving_throws = {}                                # str → '+8', int → '+3', …
 
@@ -77,11 +83,11 @@ async def scrape_character(url: str, playwright):
             # 2. modifier: "+8", "-1", "+0", …
             mod_text = (await row.locator(
                 '.ddbc-saving-throws-summary__ability-modifier'
-            ).inner_text()).strip()          # already contains + / -
+            ).inner_text()).replace('\n', '').strip()          # already contains + / -
 
             # store or print
             saving_throws[ability] = mod_text
-            print(f"{ability} {mod_text}")
+            #print(f"{ability} {mod_text}")
         
         #Subclass
         features_tab = page.get_by_role("radio", name="Features & Traits", exact=True)
@@ -96,19 +102,19 @@ async def scrape_character(url: str, playwright):
             root = frame
 
         # --- 2. wait for the Class-features column to exist -----------------------
-        await root.wait_for_selector(".ct-class-detail__features", timeout=15_000)
+        await root.wait_for_selector(".ct-class-detail__features", timeout=15_000, state="visible")
 
         # Some sheets lazy-render inside that column only after first scroll
-        await root.locator(".ct-class-detail__features").scroll_into_view_if_needed()
+        await root.locator(".ct-class-detail__features").first.scroll_into_view_if_needed()
         await root.wait_for_timeout(500)          # give React a beat to mount snippets
 
         # --- 3. locate every class-feature snippet --------------------------------
         snippets = root.locator(".ct-class-detail__features .ct-feature-snippet--class")
         count = await snippets.count()
-        print("DEBUG: snippet blocks found →", count)
+        #print("DEBUG: snippet blocks found →", count)
 
         if count == 0:
-            print("No snippets rendered; try a longer wait or scroll")
+            #print("No snippets rendered; try a longer wait or scroll")
             return
 
         # --- 4. find any heading that ends with “Subclass” ------------------------
@@ -123,7 +129,7 @@ async def scrape_character(url: str, playwright):
             # Remove level prefixes like "3:" or "4: "
             heading_core = heading.split(":", 1)[-1].strip()
 
-            print("DEBUG: heading →", heading_core)             # ← inspect what we see
+            #print("DEBUG: heading →", heading_core)             # ← inspect what we see
 
             if SUBCLASS_RE.search(heading_core):
                 choice = block.locator(".ct-feature-snippet__choice").first
@@ -136,13 +142,11 @@ async def scrape_character(url: str, playwright):
         else:
             print("Subclass not present on this sheet")
         # ----------------------------------------------------------------
-        #
-        #
-        #
-        #
-        return dict(url=url, level=level, cls=class_text.strip(), subclass = subclass_names, abilityscores = ability_scores, savingthrows = saving_throws, ac = armorclass, hp = maxhp)
-    except Exception as exc:
-        print(f"[warn] {url} – {exc}")
+        return dict(url=url, name=thread_name, species=species, level=level, cls=class_text.strip(), subclass = subclass_names, abilityscores = ability_scores, savingthrows = saving_throws, ac = armorclass, hp = maxhp)
+    except Exception as e:
+        print(f"[warn] {url} – {e}")
+        global scrapefail
+        scrapefail.append(dict(url=url, name=thread_name))
         return None
     finally:
         await browser.close()
@@ -151,33 +155,48 @@ async def scrape_character(url: str, playwright):
 async def gather_discord_urls(bot) -> list[str]:
     """Collect every D&D Beyond URL in the target channel (flat or forum)."""
     channel = bot.get_channel(CHANNEL_ID)
+    pairs = set()
     urls = set()
     print(channel)
+    try:
+        # Forum channels (GUILD_FORUM) consist of many threads (“posts”)
+        if hasattr(channel, "threads"):
+            print(channel)
+            # First, pick up already-created threads
+            for thread in channel.threads:
+                try:
+                    print(thread.name)
+                    async for m in thread.history(limit=None, oldest_first=True):
+                        #print(m)
+                        match = URL_RE.search(m.content)
+                        if match:
+                            url = match.group()
+                            pairs.add((thread.name, url))
+                            break
+                except Exception as e:
+                    print("Exception in thread", e)
 
-    # Forum channels (GUILD_FORUM) consist of many threads (“posts”)
-    if hasattr(channel, "threads"):
-        print(channel)
-        # First, pick up already-created threads
-        for thread in channel.threads:
-            print(thread)
-            async for m in thread.history(limit=None, oldest_first=True):
+            # Then, fetch archived threads just in case
+            '''async for thread in channel.archived_threads(limit=None):
+                print(thread)
+                async for m in thread.history(limit=None, oldest_first=True):
+                    #print(m)
+                    match = URL_RE.search(m.content)
+                    if match:
+                        url = match.group()
+                        pairs.add((thread.name, url))
+                        break'''
+
+        # Plain text / announcement / news channels
+        else:
+            async for m in channel.history(limit=None, oldest_first=True):
                 print(m)
                 urls.update(URL_RE.findall(m.content))
 
-        # Then, fetch archived threads just in case
-        async for thread in channel.archived_threads(limit=None):
-            print(thread)
-            async for m in thread.history(limit=None, oldest_first=True):
-                print(m)
-                urls.update(URL_RE.findall(m.content))
-
-    # Plain text / announcement / news channels
-    else:
-        async for m in channel.history(limit=None, oldest_first=True):
-            print(m)
-            urls.update(URL_RE.findall(m.content))
-
-    return sorted(urls)
+        return sorted(pairs)
+    except Exception as e:
+        print("Discord Scrape Failed", e)
+        return None
 
 
 async def main():
@@ -189,28 +208,40 @@ async def main():
     async def on_ready():
         try:
             print(f"Logged in as {bot.user} – collecting URLs…")
-            urls = await gather_discord_urls(bot)
-            print(f"Found {len(urls)} D&D Beyond links")
+            pairs = await gather_discord_urls(bot)
+            print(f"Found {len(pairs)} D&D Beyond links")
+            #Write Links to csv to avoid calling discord again
+            with open("discord_links.csv", "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["Thread Name", "Character URL"])
+                for thread_name, url in pairs:
+                    writer.writerow([thread_name, url])
 
             playwright = await async_playwright().start()
             sem = asyncio.Semaphore(CONCURRENCY)
             results = []
 
-            async def bound_scrape(u):
+            async def bound_scrape(p):
                 async with sem:
-                    res = await scrape_character(u, playwright)
+                    res = await scrape_character(p, playwright)
                     if res:
                         results.append(res)
 
-            await asyncio.gather(*(bound_scrape(u) for u in urls))
+            await asyncio.gather(*(bound_scrape(p) for p in pairs))
             await playwright.stop()
 
             # --- write csv ---------------------------------------------------
             with open(CSV_PATH, "w", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f,
-                        fieldnames=["url", "level", "cls", "subclass", "abilityscores", "savingthrows", "ac", "hp"])
+                        fieldnames=["url", "name", "species", "level", "cls", "subclass", "abilityscores", "savingthrows", "ac", "hp"])
                 writer.writeheader()
                 writer.writerows(results)
+            # ----------------------------------------------------------------
+            with open(FAILED_CSV_PATH, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f,
+                        fieldnames=["url", "name"])
+                writer.writeheader()
+                writer.writerows(scrapefail)
             # ----------------------------------------------------------------
 
             print(f"Wrote {len(results)} rows ➜ {CSV_PATH}")
